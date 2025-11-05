@@ -8,7 +8,7 @@ from jetengine.engine.sequence import RunType
 from jetengine.kernels.triton.attention import sparse_attn_varlen
 # from jetengine.kernels.triton.attention import fused_kv_cache_attention
 # from jetengine.kernels.triton.attention import fused_kv_cache_attention_v5
-from flash_attn import flash_attn_with_kvcache
+from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
 
 
 @triton.jit
@@ -88,7 +88,7 @@ class BlockAttention(Attention):
             o = sparse_attn_varlen(q, k, v,
                                 cu_seqlens_q=context.cu_seqlens_q,
                                 cu_seqlens_k=context.cu_seqlens_k,
-                                staircase_size=context.block_length)
+                                staircase_size=1)
         else:
             q = q.view(-1, context.block_length, self.num_heads, self.head_dim)
             k = k.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
@@ -96,7 +96,7 @@ class BlockAttention(Attention):
             o = flash_attn_with_kvcache(q, k_cache=k_cache, v_cache=v_cache, k=k, v=v,
                                         cache_seqlens=context.context_lens,
                                         block_table=context.block_tables,
-                                        causal=False)  # Assuming non-causal for benchmark consistency     
+                                        causal=True)  # Assuming non-causal for benchmark consistency     
         o = o.view(-1, self.num_heads * self.head_dim)
         return o
 

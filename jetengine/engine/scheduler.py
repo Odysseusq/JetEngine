@@ -67,9 +67,25 @@ class Scheduler:
 
     def postprocess(self, seqs: list[Sequence], logits: torch.Tensor, run_type: RunType):
         if run_type == RunType.PREFILL:
-            for seq in seqs:
+            if self.consistent_sampling_params:
+                if seqs[0].top_k > 0:
+                    probs = self.sample_pipe(logits, temperature=seqs[0].temperature, top_k=seqs[0].top_k, top_p=seqs[0].top_p) 
+                else:
+                    probs = self.sample_pipe_topk0(logits, temperature=seqs[0].temperature, top_p=seqs[0].top_p)
+            for idx, seq in enumerate(seqs):
+                # print(f"prefilling before, intermediate block: {seq.intermediate_block_tokens}")
                 seq.num_cached_tokens = seq.num_prefill_tokens
                 seq.status = SequenceStatus.DENOISING
+                if not self.consistent_sampling_params:
+                    if seq.top_k > 0:
+                        probs = self.sample_pipe(logits[idx], temperature=seq.temperature, top_k=seq.top_k, top_p=seq.top_p) 
+                    else:
+                        probs = self.sample_pipe_topk0(logits[idx], temperature=seq.temperature, top_p=seq.top_p)
+                    seq_x0 = torch.multinomial(probs, num_samples=1).squeeze(-1) 
+                else:
+                    seq_x0 = torch.multinomial(probs[idx], num_samples=1).squeeze(-1) 
+                seq.intermediate_block_tokens[0] = seq_x0.item()
+                # print(f"prefilling after, intermediate block: {seq.intermediate_block_tokens}")
         
         elif run_type == RunType.DENOISE:
             start_idx = 0
@@ -80,19 +96,20 @@ class Scheduler:
                     probs = self.sample_pipe_topk0(logits, temperature=seqs[0].temperature, top_p=seqs[0].top_p)
             for seq in seqs:
                 # Extract the part of the tensors relevant to this sequence
-                if seq.status == SequenceStatus.DENOISING:
-                    block_len = seq.block_length
-                    if not self.consistent_sampling_params:
-                        if seq.top_k > 0:
-                            probs = self.sample_pipe(logits[start_idx : start_idx + block_len], temperature=seq.temperature, top_k=seq.top_k, top_p=seq.top_p) 
-                        else:
-                            probs = self.sample_pipe_topk0(logits[start_idx : start_idx + block_len], temperature=seq.temperature, top_p=seq.top_p)
-                        seq_x0 = torch.multinomial(probs, num_samples=1).squeeze(-1) 
-                        seq_x0_p = torch.gather(probs, -1, seq_x0.unsqueeze(-1)).squeeze(-1)    
+                # print(f"denoise before, intermediate block: {seq.intermediate_block_tokens}")
+                block_len = seq.block_length
+                if not self.consistent_sampling_params:
+                    if seq.top_k > 0:
+                        probs = self.sample_pipe(logits[start_idx : start_idx + block_len], temperature=seq.temperature, top_k=seq.top_k, top_p=seq.top_p) 
                     else:
-                        seq_x0 = torch.multinomial(probs[start_idx : start_idx + block_len], num_samples=1).squeeze(-1) 
-                        seq_x0_p = torch.gather(probs[start_idx : start_idx + block_len], -1, seq_x0.unsqueeze(-1)).squeeze(-1)    
+                        probs = self.sample_pipe_topk0(logits[start_idx : start_idx + block_len], temperature=seq.temperature, top_p=seq.top_p)
+                    seq_x0 = torch.multinomial(probs, num_samples=1).squeeze(-1) 
+                    seq_x0_p = torch.gather(probs, -1, seq_x0.unsqueeze(-1)).squeeze(-1)    
+                else:
+                    seq_x0 = torch.multinomial(probs[start_idx : start_idx + block_len], num_samples=1).squeeze(-1) 
+                    seq_x0_p = torch.gather(probs[start_idx : start_idx + block_len], -1, seq_x0.unsqueeze(-1)).squeeze(-1)    
                     
+                if seq.status == SequenceStatus.DENOISING:
                     current_block_tensor = torch.tensor(seq.intermediate_block_tokens, device=logits.device)
                     mask_index = (current_block_tensor == self.mask_token_id)
                     num_to_transfer = seq.num_transfer_tokens_per_step[seq.current_denoising_step]
@@ -160,8 +177,10 @@ class Scheduler:
                     seq.num_to_transfer = 0
                     if not seq.is_finished:
                         seq.start_new_block()
+                        seq.intermediate_block_tokens[0] = seq_x0[-1].item()
 
                 start_idx += seq.block_length
+                # print(f"denoise after, intermediate block: {seq.intermediate_block_tokens}")
                 
         # Filter out finished sequences from the running list
         finished_seqs = [seq for seq in self.running if seq.is_finished]
