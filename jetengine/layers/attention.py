@@ -88,15 +88,30 @@ class BlockAttention(Attention):
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+                                       softmax_scale=self.scale, causal=True)
         else:
             q = q.view(-1, context.block_length, self.num_heads, self.head_dim)
             k = k.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
             v = v.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
-            o = flash_attn_with_kvcache(q, k_cache=k_cache, v_cache=v_cache, k=k, v=v,
-                                        cache_seqlens=context.context_lens,
-                                        block_table=context.block_tables,
-                                        causal=True)  # Assuming non-causal for benchmark consistency     
+            o = torch.zeros_like(q)
+            if context.seq_idx_denoising:
+                q_denoising = q[context.seq_idx_denoising]
+                k_denoising = k[context.seq_idx_denoising]
+                v_denoising = v[context.seq_idx_denoising]
+                o_denoising = flash_attn_with_kvcache(q_denoising, k_cache=k_cache, v_cache=v_cache, k=k_denoising, v=v_denoising,
+                                                     cache_seqlens=context.context_lens_denoising,
+                                                     block_table=context.block_tables_denoising,
+                                                     causal=False)
+                o[context.seq_idx_denoising] = o_denoising
+            if context.seq_idx_saving:
+                q_saving = q[context.seq_idx_saving]
+                k_saving = k[context.seq_idx_saving]
+                v_saving = v[context.seq_idx_saving]
+                o_saving = flash_attn_with_kvcache(q_saving, k_cache=k_cache, v_cache=v_cache, k=k_saving, v=v_saving,
+                                                  cache_seqlens=context.context_lens_saving,
+                                                  block_table=context.block_tables_saving,
+                                                  causal=True)
+                o[context.seq_idx_saving] = o_saving
         o = o.view(-1, self.num_heads * self.head_dim)
         return o
 

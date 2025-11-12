@@ -184,9 +184,10 @@ class ModelRunner:
 
     def prepare_denoise(self, seqs: list[Sequence]):
         input_ids, positions = [], []
-        cached_lens = []
+        cached_lens_denoising, cached_lens_saving = [], []
+        seq_idx_denoising, seq_idx_saving = [], []
         
-        for seq in seqs:
+        for idx, seq in enumerate(seqs):
             # The query is the current intermediate block
             q_tokens = seq.intermediate_block_tokens
             q_len = len(q_tokens)
@@ -197,17 +198,30 @@ class ModelRunner:
             input_ids.extend(q_tokens)
             # Positions are global
             positions.extend(range(k_len, k_len + q_len))
-            cached_lens.append(k_len)
+            if seq.status == SequenceStatus.DENOISING:
+                seq_idx_denoising.append(idx)
+                cached_lens_denoising.append(k_len)
+            elif seq.status == SequenceStatus.SAVING:
+                seq_idx_saving.append(idx)
+                cached_lens_saving.append(k_len)
+            else:
+                raise ValueError(f"Sequence at index {idx} has invalid status for denoising: {seq.status}")
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64).cuda()
         positions = torch.tensor(positions, dtype=torch.int64).cuda()
-        cached_lens = torch.tensor(cached_lens, dtype=torch.int32).cuda()
-        block_tables = self.prepare_block_tables(seqs)
+        cached_lens_denoising = torch.tensor(cached_lens_denoising, dtype=torch.int32).cuda()
+        cached_lens_saving = torch.tensor(cached_lens_saving, dtype=torch.int32).cuda()
+        block_tables_denoising = self.prepare_block_tables([seqs[i] for i in seq_idx_denoising]) if seq_idx_denoising else None
+        block_tables_saving = self.prepare_block_tables([seqs[i] for i in seq_idx_saving]) if seq_idx_saving else None
         
         set_context(
             run_type=RunType.DENOISE,
-            context_lens=cached_lens,
-            block_tables=block_tables,
+            seq_idx_denoising=seq_idx_denoising,
+            seq_idx_saving=seq_idx_saving,
+            context_lens_denoising=cached_lens_denoising,
+            context_lens_saving=cached_lens_saving,
+            block_tables_denoising=block_tables_denoising,
+            block_tables_saving=block_tables_saving,
             block_length=self.config.block_length
         )
         

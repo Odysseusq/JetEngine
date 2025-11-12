@@ -110,7 +110,7 @@ class Scheduler:
                     else:
                         # Compute confidence for low_confidence strategies
                         seq_x0_p_input = torch.cat([seq_x0_p[:1], seq_x0_p[:-1]])
-                        confidence = torch.where(mask_index, seq_x0_p_input, -np.inf)
+                        confidence = torch.where(mask_index, seq_x0_p_input, -np.inf) # confidence[0] is always -inf
                         
                         if 'low_confidence_dynamic' in seq.remasking_strategy:
                             transfer_index = confidence > seq.dynamic_threshold
