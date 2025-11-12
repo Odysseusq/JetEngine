@@ -65,55 +65,41 @@ class Scheduler:
 
         return None, None     
 
+    def _sample_probs(self, logits, seq):
+        """Sample probabilities from logits using sequence parameters."""
+        pipe = self.sample_pipe if seq.top_k > 0 else self.sample_pipe_topk0
+        params = {'temperature': seq.temperature, 'top_p': seq.top_p}
+        if seq.top_k > 0:
+            params['top_k'] = seq.top_k
+        return pipe(logits, **params)
+    
     def postprocess(self, seqs: list[Sequence], logits: torch.Tensor, run_type: RunType):
+        # Compute probabilities once if consistent sampling params
+        batch_probs = None
+        if self.consistent_sampling_params:
+            batch_probs = self._sample_probs(logits, seqs[0])
+        
         if run_type == RunType.PREFILL:
-            if self.consistent_sampling_params:
-                if seqs[0].top_k > 0:
-                    probs = self.sample_pipe(logits, temperature=seqs[0].temperature, top_k=seqs[0].top_k, top_p=seqs[0].top_p) 
-                else:
-                    probs = self.sample_pipe_topk0(logits, temperature=seqs[0].temperature, top_p=seqs[0].top_p)
             for idx, seq in enumerate(seqs):
-                # print(f"prefilling before, intermediate block: {seq.intermediate_block_tokens}")
                 seq.num_cached_tokens = seq.num_prefill_tokens
                 seq.status = SequenceStatus.DENOISING
-                if not self.consistent_sampling_params:
-                    if seq.top_k > 0:
-                        probs = self.sample_pipe(logits[idx], temperature=seq.temperature, top_k=seq.top_k, top_p=seq.top_p) 
-                    else:
-                        probs = self.sample_pipe_topk0(logits[idx], temperature=seq.temperature, top_p=seq.top_p)
-                    seq_x0 = torch.multinomial(probs, num_samples=1).squeeze(-1) 
-                else:
-                    seq_x0 = torch.multinomial(probs[idx], num_samples=1).squeeze(-1) 
+                probs = batch_probs[idx] if batch_probs is not None else self._sample_probs(logits[idx], seq)
+                seq_x0 = torch.multinomial(probs, num_samples=1).squeeze(-1)
                 seq.intermediate_block_tokens[0] = seq_x0.item()
-                # print(f"prefilling after, intermediate block: {seq.intermediate_block_tokens}")
         
         elif run_type == RunType.DENOISE:
             start_idx = 0
-            if self.consistent_sampling_params:
-                if seqs[0].top_k > 0:
-                    probs = self.sample_pipe(logits, temperature=seqs[0].temperature, top_k=seqs[0].top_k, top_p=seqs[0].top_p) 
-                else:
-                    probs = self.sample_pipe_topk0(logits, temperature=seqs[0].temperature, top_p=seqs[0].top_p)
             for seq in seqs:
-                # Extract the part of the tensors relevant to this sequence
-                # print(f"denoise before, intermediate block: {seq.intermediate_block_tokens}")
                 block_len = seq.block_length
-                if not self.consistent_sampling_params:
-                    if seq.top_k > 0:
-                        probs = self.sample_pipe(logits[start_idx : start_idx + block_len], temperature=seq.temperature, top_k=seq.top_k, top_p=seq.top_p) 
-                    else:
-                        probs = self.sample_pipe_topk0(logits[start_idx : start_idx + block_len], temperature=seq.temperature, top_p=seq.top_p)
-                    seq_x0 = torch.multinomial(probs, num_samples=1).squeeze(-1) 
-                    seq_x0_p = torch.gather(probs, -1, seq_x0.unsqueeze(-1)).squeeze(-1)    
-                else:
-                    seq_x0 = torch.multinomial(probs[start_idx : start_idx + block_len], num_samples=1).squeeze(-1) 
-                    seq_x0_p = torch.gather(probs[start_idx : start_idx + block_len], -1, seq_x0.unsqueeze(-1)).squeeze(-1)    
+                logits_slice = logits[start_idx : start_idx + block_len]
+                probs = batch_probs[start_idx : start_idx + block_len] if batch_probs is not None else self._sample_probs(logits_slice, seq)
+                seq_x0 = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                seq_x0_p = torch.gather(probs, -1, seq_x0.unsqueeze(-1)).squeeze(-1)
                     
                 if seq.status == SequenceStatus.DENOISING:
                     current_block_tensor = torch.tensor(seq.intermediate_block_tokens, device=logits.device)
                     mask_index = (current_block_tensor == self.mask_token_id)
                     num_to_transfer = seq.num_transfer_tokens_per_step[seq.current_denoising_step]
-                    
                     transfer_index = torch.zeros_like(seq_x0, dtype=torch.bool)
                     
                     if seq.remasking_strategy == 'sequential':
@@ -121,68 +107,51 @@ class Scheduler:
                             first_mask_pos = mask_index.nonzero(as_tuple=True)[0].min().item()
                             end_pos = min(first_mask_pos + num_to_transfer, block_len)
                             transfer_index[first_mask_pos:end_pos] = True
-                    
-                    elif 'low_confidence_static' in seq.remasking_strategy:
-                        confidence = torch.where(mask_index, seq_x0_p, -np.inf)
-                        # For dynamic, add threshold logic here if desired
-                        _, top_indices = torch.topk(confidence, num_to_transfer)
-                        transfer_index[top_indices] = True
-                    
-                    elif 'low_confidence_dynamic' in seq.remasking_strategy:
-                        confidence = torch.where(mask_index, seq_x0_p, -np.inf)
-                        transfer_index = torch.where(confidence > seq.dynamic_threshold, True, False)
-                        if sum(transfer_index) < num_to_transfer:
+                    else:
+                        # Compute confidence for low_confidence strategies
+                        seq_x0_p_input = torch.cat([seq_x0_p[:1], seq_x0_p[:-1]])
+                        confidence = torch.where(mask_index, seq_x0_p_input, -np.inf)
+                        
+                        if 'low_confidence_dynamic' in seq.remasking_strategy:
+                            transfer_index = confidence > seq.dynamic_threshold
+                            transfer_index[-1] = False
+                            if transfer_index.sum() < num_to_transfer:
+                                _, top_indices = torch.topk(confidence, num_to_transfer)
+                                transfer_index.fill_(False)
+                                transfer_index[top_indices] = True
+                                transfer_index[-1] = False
+                            num_to_transfer = max(transfer_index.sum().item(), num_to_transfer)
+                        elif 'low_confidence_static' in seq.remasking_strategy:
                             _, top_indices = torch.topk(confidence, num_to_transfer)
                             transfer_index[top_indices] = True
-                        num_to_transfer = transfer_index.sum().item() if transfer_index.sum().item() > 0 else num_to_transfer
-                    elif 'entropy_bounded' in seq.remasking_strategy:
-                        block_probs = probs[start_idx : start_idx + block_len]
-                        P = block_probs[mask_index]
-                        eps = 1e-12
-                        entropies = -(P.clamp_min(eps) * (P.clamp_min(eps)).log()).sum(dim=-1)
-                        ent_sorted, order = torch.sort(entropies, dim=0, descending=False)
-                        cumsum = torch.cumsum(ent_sorted, dim=0)
-                        k = torch.searchsorted(cumsum, torch.tensor(seq.eb_threshold, device=P.device), right=False).item()
-                        if k == 0:
-                            k = 1
-                        # print(k)
-                        selected_token_indices = mask_index.nonzero(as_tuple=True)[0][order[:k]]
-                        # print(selected_token_indices)
-                        transfer_index[selected_token_indices] = True
-                        num_to_transfer = k
+                        else:
+                            raise ValueError(f"Unknown remasking strategy: {seq.remasking_strategy}")
 
-                    # update
+                    # Update intermediate block tokens
+                    seq_x0_input = torch.cat([current_block_tensor[:1], seq_x0[:-1]])
                     new_block_list = current_block_tensor.tolist()
-                    accepted_tokens = seq_x0[transfer_index].tolist()
-                    original_indices = transfer_index.nonzero(as_tuple=True)[0].tolist()
-
-                    for idx, token in zip(original_indices, accepted_tokens):
-                        new_block_list[idx] = token
+                    for idx in transfer_index.nonzero(as_tuple=True)[0].tolist():
+                        new_block_list[idx] = seq_x0_input[idx].item()
                     seq.intermediate_block_tokens = new_block_list
-                    
                     seq.current_denoising_step += 1
                     
                     # Check if block is fully denoised
                     is_fully_denoised = (self.mask_token_id not in seq.intermediate_block_tokens) or \
                                         (seq.current_denoising_step >= seq.denoising_steps)
-
                     if is_fully_denoised:
-                        # Block is done, commit it and check if generation is finished
                         seq.status = SequenceStatus.FINISHED if seq.is_finished else SequenceStatus.SAVING
                     seq.num_to_transfer = num_to_transfer
                     
                 elif seq.status == SequenceStatus.SAVING:
-                    # If saving, commit the block and start a new one
                     seq.commit_block(seq.intermediate_block_tokens)
                     seq.num_to_transfer = 0
                     if not seq.is_finished:
                         seq.start_new_block()
                         seq.intermediate_block_tokens[0] = seq_x0[-1].item()
 
-                start_idx += seq.block_length
-                # print(f"denoise after, intermediate block: {seq.intermediate_block_tokens}")
+                start_idx += block_len
                 
-        # Filter out finished sequences from the running list
+        # Clean up finished sequences
         finished_seqs = [seq for seq in self.running if seq.is_finished]
         self.running = [seq for seq in self.running if not seq.is_finished]
         for seq in finished_seqs:

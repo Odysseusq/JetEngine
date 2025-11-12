@@ -26,7 +26,7 @@ class Sequence:
         self.prompt_token_ids = prompt_token_ids
         prompt_len = len(self.prompt_token_ids)
         
-        self.num_prefill_tokens = (prompt_len // self.block_length) * self.block_length
+        self.num_prefill_tokens = prompt_len
         prefill_part = self.prompt_token_ids[:self.num_prefill_tokens]
         
         first_denoise_part = self.prompt_token_ids[self.num_prefill_tokens:]
@@ -70,8 +70,8 @@ class Sequence:
         return self.token_ids[key]
 
     def _get_num_transfer_tokens(self):
-        base = self.block_length // self.denoising_steps
-        remainder = self.block_length % self.denoising_steps
+        base = (self.block_length - 1) // self.denoising_steps
+        remainder = (self.block_length - 1) % self.denoising_steps
         num_tokens = [base] * self.denoising_steps
         for i in range(remainder):
             num_tokens[i] += 1
