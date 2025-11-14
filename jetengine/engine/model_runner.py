@@ -7,8 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from jetengine.config import Config
 from jetengine.engine.sequence import Sequence, RunType, SequenceStatus
-from jetengine.models.sdar import SDARForCausalLM
-from jetengine.models.sdar_moe import SDARMoeForCausalLM
+from jetengine.models.qwen3_next import Qwen3NextForCausalLM
 from jetengine.utils.context import set_context, get_context, reset_context
 from jetengine.utils.loader import load_model
 
@@ -29,10 +28,8 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        if "sdar" in hf_config.model_type and "moe" in hf_config.model_type:
-            self.model = SDARMoeForCausalLM(hf_config)
-        elif "sdar" in hf_config.model_type:
-            self.model = SDARForCausalLM(hf_config)
+        if "next" in hf_config.model_type:
+            self.model = Qwen3NextForCausalLM(hf_config)
         else:
             raise ValueError(f"Unsupported model type: {hf_config.model_type}")
         load_model(self.model, config.model)
