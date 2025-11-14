@@ -84,13 +84,13 @@ class Qwen3NextAttention(nn.Module):
         q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
         q_by_head, gate = q_gate.view(-1, self.num_heads, self.head_dim * 2).chunk(2, dim=-1)
         q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
+        q = q_by_head.view(-1, self.q_size)
         k_by_head = k.view(-1, self.num_kv_heads, self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
-        o = o * gate.view(o.shape).sigmoid()
+        o = o * gate.reshape(o.shape).sigmoid()
         output = self.o_proj(o)
         return output
 

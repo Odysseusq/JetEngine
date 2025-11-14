@@ -46,7 +46,7 @@ def _prepare_fused_tensors(model: nn.Module, device: torch.device | str = "cuda"
 
 def _is_moe_expert_weight(weight_name: str) -> bool:
     """Check if weight belongs to an MoE expert."""
-    return 'experts.' in weight_name and ('gate_up_proj' in weight_name or 'down_proj' in weight_name)
+    return 'experts.' in weight_name and '.shared_expert' not in weight_name and ('gate_up_proj' in weight_name or 'down_proj' in weight_name)
 
 def _load_expert_weight_to_fused(model: nn.Module, weight_name: str, weight_tensor: torch.Tensor, shard_id=None):
     """Load expert weight directly into the appropriate fused tensor with tensor parallel support.
@@ -123,28 +123,44 @@ def _load_expert_weight_to_fused(model: nn.Module, weight_name: str, weight_tens
 def load_model(model: nn.Module, path: str):
     _prepare_fused_tensors(model)
 
+    # RMS norm keys that need special handling (add 1 to weight)
+    rms_norm_keys = ['model.norm', '.input_layernorm', '.post_attention_layernorm', '.q_norm', '.k_norm']
+    
+    def _is_rms_norm_weight(name: str) -> bool:
+        """Check if weight belongs to an RMS norm layer."""
+        if 'weight' not in name:
+            return False
+        for key in rms_norm_keys:
+            if key in name:
+                return True
+        return False
+
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
+                loaded_weight = f.get_tensor(weight_name)
+                # Apply RMS norm adjustment
+                if _is_rms_norm_weight(weight_name):
+                    loaded_weight = loaded_weight + 1
                 for k in packed_modules_mapping:
                     if k in weight_name:
                         v, shard_id = packed_modules_mapping[k]
                         param_name = weight_name.replace(k, v)
                         if _is_moe_expert_weight(param_name):
-                            _load_expert_weight_to_fused(model, param_name, f.get_tensor(weight_name), shard_id)
+                            _load_expert_weight_to_fused(model, param_name, loaded_weight, shard_id)
                         else:
                             param = model.get_parameter(param_name)
                             weight_loader = getattr(param, "weight_loader")
-                            weight_loader(param, f.get_tensor(weight_name), shard_id)
+                            weight_loader(param, loaded_weight, shard_id)
                         break
                 else:
                     if _is_moe_expert_weight(weight_name):
-                        _load_expert_weight_to_fused(model, weight_name, f.get_tensor(weight_name))
+                        _load_expert_weight_to_fused(model, weight_name, loaded_weight)
                     else:
                         param = model.get_parameter(weight_name)
                         weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                        weight_loader(param, f.get_tensor(weight_name))
+                        weight_loader(param, loaded_weight)
 
 
 def load_from_hf_model(target_model: nn.Module, hf_model: nn.Module):
