@@ -14,7 +14,7 @@ from jetengine.utils.loader import load_model
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, port: int, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -23,7 +23,7 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group("nccl", f"tcp://localhost:{port}", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -38,7 +38,8 @@ class ModelRunner:
         self.allocate_kv_cache()
         # CUDA graph capture for block diffusion is complex and omitted for this example
         if not self.enforce_eager:
-            self.capture_cudagraph()
+            # self.capture_cudagraph()
+            raise NotImplementedError("CUDA graph capture is not implemented for block decoding. Please set enforce_eager=True.")
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 

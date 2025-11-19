@@ -16,6 +16,7 @@ from jetengine.engine.sequence import Sequence, RunType
 from jetengine.engine.scheduler import Scheduler
 from jetengine.engine.model_runner import ModelRunner
 from jetengine.utils.loader import load_from_hf_model
+from jetengine.utils.network import find_free_port
 
 
 class LLMEngine:
@@ -26,14 +27,15 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         self.ps = []
         self.events = []
+        port = find_free_port()
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            process = ctx.Process(target=ModelRunner, args=(config, port, i, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+        self.model_runner = ModelRunner(config, port, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True, trust_remote_code=True)
         config.eos = self.tokenizer.eos_token_id
         config.mask_token_id = self.tokenizer.mask_token_id if self.tokenizer.mask_token_id is not None else self.tokenizer.pad_token_id
