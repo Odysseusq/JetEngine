@@ -27,7 +27,7 @@ class RotaryEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         self.head_size = head_size
-        assert rotary_dim == head_size
+        self.rotary_dim = rotary_dim
         inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
@@ -48,10 +48,23 @@ class RotaryEmbedding(nn.Module):
         cos, sin = cos_sin.chunk(2, dim=-1)
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
-        query = apply_rotary_emb(query, cos, sin).view(query_shape)
+        if self.rotary_dim < self.head_size:
+            q_rot, q_pass = query[..., :self.rotary_dim], query[..., self.rotary_dim:]
+            q_rot = apply_rotary_emb(q_rot, cos, sin)
+            query = torch.cat((q_rot, q_pass), dim=-1)
+        else:
+            query = apply_rotary_emb(query, cos, sin)
+        query = query.view(query_shape)
+        
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
-        key = apply_rotary_emb(key, cos, sin).view(key_shape)
+        if self.rotary_dim < self.head_size:
+            k_rot, k_pass = key[..., :self.rotary_dim], key[..., self.rotary_dim:]
+            k_rot = apply_rotary_emb(k_rot, cos, sin)
+            key = torch.cat((k_rot, k_pass), dim=-1)
+        else:
+            key = apply_rotary_emb(key, cos, sin)
+        key = key.view(key_shape)
         return query, key
 
 

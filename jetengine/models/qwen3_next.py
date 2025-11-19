@@ -33,6 +33,7 @@ class Qwen3NextAttention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
+        rotary_dim: int | None = None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -61,7 +62,7 @@ class Qwen3NextAttention(nn.Module):
         )
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
+            rotary_dim=rotary_dim or self.head_dim,
             max_position=max_position,
             base=rope_theta,
             rope_scaling=rope_scaling,
@@ -157,6 +158,8 @@ class Qwen3NextDecoderLayer(nn.Module):
 
     def __init__(self, config, layer_idx: int) -> None:
         super().__init__()
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        rotary_dim = int(head_dim * getattr(config, "partial_rotary_factor", 1.0))
         self.self_attn = Qwen3NextAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -167,6 +170,7 @@ class Qwen3NextDecoderLayer(nn.Module):
             qkv_bias=getattr(config, "attention_bias", False),
             rope_theta=getattr(config, "rope_theta", 10000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            rotary_dim=rotary_dim,
         )
 
         is_moe_layer = (
