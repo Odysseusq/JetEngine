@@ -38,8 +38,8 @@ class ModelRunner:
         self.allocate_kv_cache()
         # CUDA graph capture for block diffusion is complex and omitted for this example
         if not self.enforce_eager:
-            # self.capture_cudagraph()
-            raise NotImplementedError("CUDA graph capture is not implemented for block decoding. Please set enforce_eager=True.")
+            self.capture_cudagraph()
+            # raise NotImplementedError("CUDA graph capture is not implemented for block decoding. Please set enforce_eager=True.")
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -207,19 +207,43 @@ class ModelRunner:
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64).cuda()
         positions = torch.tensor(positions, dtype=torch.int64).cuda()
-        cached_lens_denoising = torch.tensor(cached_lens_denoising, dtype=torch.int32).cuda()
-        cached_lens_saving = torch.tensor(cached_lens_saving, dtype=torch.int32).cuda()
-        block_tables_denoising = self.prepare_block_tables([seqs[i] for i in seq_idx_denoising]) if seq_idx_denoising else None
-        block_tables_saving = self.prepare_block_tables([seqs[i] for i in seq_idx_saving]) if seq_idx_saving else None
+
+        bs = len(seqs)
+        
+        # Pad and convert denoising indices
+        num_denoising = len(seq_idx_denoising)
+        pad_len_denoising = bs - num_denoising
+        indices_denoising_read = torch.tensor(seq_idx_denoising + [0] * pad_len_denoising, dtype=torch.int64).cuda()
+        indices_denoising_out = torch.tensor(seq_idx_denoising + [bs] * pad_len_denoising, dtype=torch.int64).cuda()
+        cached_lens_denoising = torch.tensor(cached_lens_denoising + [0] * pad_len_denoising, dtype=torch.int32).cuda()
+        
+        seqs_denoising = [seqs[i] for i in seq_idx_denoising]
+        if pad_len_denoising > 0 and seqs:
+            seqs_denoising.extend([seqs[0]] * pad_len_denoising)
+        block_tables_denoising = self.prepare_block_tables(seqs_denoising)
+
+        # Pad and convert saving indices
+        num_saving = len(seq_idx_saving)
+        pad_len_saving = bs - num_saving
+        indices_saving_read = torch.tensor(seq_idx_saving + [0] * pad_len_saving, dtype=torch.int64).cuda()
+        indices_saving_out = torch.tensor(seq_idx_saving + [bs] * pad_len_saving, dtype=torch.int64).cuda()
+        cached_lens_saving = torch.tensor(cached_lens_saving + [0] * pad_len_saving, dtype=torch.int32).cuda()
+
+        seqs_saving = [seqs[i] for i in seq_idx_saving]
+        if pad_len_saving > 0 and seqs:
+            seqs_saving.extend([seqs[0]] * pad_len_saving)
+        block_tables_saving = self.prepare_block_tables(seqs_saving)
         
         set_context(
             run_type=RunType.DENOISE,
-            seq_idx_denoising=seq_idx_denoising,
-            seq_idx_saving=seq_idx_saving,
+            seq_idx_denoising=indices_denoising_read,
+            seq_idx_saving=indices_saving_read,
             context_lens_denoising=cached_lens_denoising,
             context_lens_saving=cached_lens_saving,
             block_tables_denoising=block_tables_denoising,
             block_tables_saving=block_tables_saving,
+            seq_idx_denoising_out=indices_denoising_out,
+            seq_idx_saving_out=indices_saving_out,
             block_length=self.config.block_length
         )
         
@@ -227,7 +251,41 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor):
-        return self.model.compute_logits(self.model(input_ids, positions))
+        context = get_context()
+        run_type = context.run_type
+        if run_type == RunType.PREFILL or self.enforce_eager or run_type is None:
+            return self.model.compute_logits(self.model(input_ids, positions))
+        
+        bs = input_ids.size(0) // self.config.block_length
+        graph_bs = next((x for x in self.graph_bs if x >= bs), None)
+        if graph_bs is None:
+            return self.model.compute_logits(self.model(input_ids, positions))
+            
+        graph = self.graphs[graph_bs]
+        global_bs = bs * self.config.block_length
+        self.static_input_ids[:global_bs].copy_(input_ids)
+        self.static_positions[:global_bs].copy_(positions)
+        self.static_seq_idx_denoising[:bs].copy_(context.seq_idx_denoising)
+        self.static_seq_idx_saving[:bs].copy_(context.seq_idx_saving)
+        self.static_seq_idx_denoising_out[:bs].copy_(context.seq_idx_denoising_out)
+        self.static_seq_idx_saving_out[:bs].copy_(context.seq_idx_saving_out)
+        self.static_context_lens_denoising[:bs].copy_(context.context_lens_denoising)
+        self.static_context_lens_saving[:bs].copy_(context.context_lens_saving)
+        if context.block_tables_denoising is not None:
+            h, w = context.block_tables_denoising.shape
+            self.static_block_tables_denoising[:h, :w].copy_(context.block_tables_denoising)
+        if context.block_tables_saving is not None:
+            h, w = context.block_tables_saving.shape
+            self.static_block_tables_saving[:h, :w].copy_(context.block_tables_saving)
+        if graph_bs > bs:
+            self.static_input_ids[global_bs:graph_bs*self.config.block_length].fill_(0)
+            self.static_positions[global_bs:graph_bs*self.config.block_length].fill_(0)
+            self.static_seq_idx_denoising[bs:graph_bs].fill_(0)
+            self.static_seq_idx_saving[bs:graph_bs].fill_(0)
+            self.static_seq_idx_denoising_out[bs:graph_bs].fill_(graph_bs)
+            self.static_seq_idx_saving_out[bs:graph_bs].fill_(graph_bs)
+        graph.replay()
+        return self.model.compute_logits(self.static_outputs[:global_bs])
 
     def run(self, seqs: list[Sequence], run_type: RunType) -> torch.Tensor:
         if run_type == RunType.PREFILL:
@@ -248,32 +306,46 @@ class ModelRunner:
         max_bs = min(self.config.max_num_seqs, 256)
         max_global_bs = max_bs * self.config.block_length
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_global_bs, dtype=torch.int64)
-        positions = torch.zeros(max_global_bs, dtype=torch.int64)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_global_bs, hf_config.hidden_size)
+        
+        self.static_input_ids = torch.zeros(max_global_bs, dtype=torch.int64)
+        self.static_positions = torch.zeros(max_global_bs, dtype=torch.int64)
+        self.static_outputs = torch.zeros(max_global_bs, hf_config.hidden_size)
+        self.static_seq_idx_denoising = torch.zeros(max_bs, dtype=torch.int64)
+        self.static_seq_idx_saving = torch.zeros(max_bs, dtype=torch.int64)
+        self.static_seq_idx_denoising_out = torch.zeros(max_bs, dtype=torch.int64)
+        self.static_seq_idx_saving_out = torch.zeros(max_bs, dtype=torch.int64)
+        self.static_context_lens_denoising = torch.zeros(max_bs, dtype=torch.int32)
+        self.static_context_lens_saving = torch.zeros(max_bs, dtype=torch.int32)
+        self.static_block_tables_denoising = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        self.static_block_tables_saving = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(run_type=RunType.DENOISE, context_lens=context_lens[:bs], block_tables=block_tables[:bs], block_length=self.config.block_length)
+            
+            # Setup context with static buffers slices
+            set_context(
+                run_type=RunType.DENOISE,
+                seq_idx_denoising=self.static_seq_idx_denoising[:bs],
+                seq_idx_saving=self.static_seq_idx_saving[:bs],
+                context_lens_denoising=self.static_context_lens_denoising[:bs],
+                context_lens_saving=self.static_context_lens_saving[:bs],
+                block_tables_denoising=self.static_block_tables_denoising[:bs],
+                block_tables_saving=self.static_block_tables_saving[:bs],
+                seq_idx_denoising_out=self.static_seq_idx_denoising_out[:bs],
+                seq_idx_saving_out=self.static_seq_idx_saving_out[:bs],
+                block_length=self.config.block_length
+            )
+            
             global_bs = bs * self.config.block_length
-            outputs[:global_bs] = self.model(input_ids[:global_bs], positions[:global_bs])    # warmup
+            self.model(self.static_input_ids[:global_bs], self.static_positions[:global_bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:global_bs] = self.model(input_ids[:global_bs], positions[:global_bs])    # capture
+                self.static_outputs[:global_bs] = self.model(self.static_input_ids[:global_bs], self.static_positions[:global_bs])
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
             torch.cuda.synchronize()
             reset_context()
-
-        self.graph_vars = dict(
-            input_ids=input_ids,
-            positions=positions,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            outputs=outputs,
-        )
