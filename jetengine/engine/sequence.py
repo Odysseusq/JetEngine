@@ -108,16 +108,8 @@ class Sequence:
     def num_new_blocks_needed(self, block_size: int) -> int:
         if not self.block_table:
             return (self.num_tokens + self.block_length + block_size - 1) // block_size
-
-        last_block_capacity = block_size - (self.num_tokens % block_size)
-        if last_block_capacity == block_size: # Current tokens perfectly fill blocks
-            last_block_capacity = 0
-        
-        remaining_tokens_to_add = self.block_length - last_block_capacity
-        if remaining_tokens_to_add <= 0:
-            return 0
-            
-        return (remaining_tokens_to_add + block_size - 1) // block_size
+        new_blocks_needed = (self.num_tokens + self.block_length) // block_size + 1 - len(self.block_table)
+        return max(0, new_blocks_needed)
 
     @property
     def is_finished(self):

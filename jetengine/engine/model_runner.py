@@ -36,15 +36,13 @@ class ModelRunner:
         # Sampler is removed from here
         self.warmup_model()
         self.allocate_kv_cache()
-        # CUDA graph capture for block diffusion is complex and omitted for this example
         if not self.enforce_eager:
             self.capture_cudagraph()
-            # raise NotImplementedError("CUDA graph capture is not implemented for block decoding. Please set enforce_eager=True.")
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
-            shm_name = "jetengineshm"
+            shm_name = f"jetengineshm_{port}"
             if rank == 0:
                 # Create (and clean up stale) shared memory
                 try:
